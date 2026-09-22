@@ -49,7 +49,7 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
 
 /// 加载 eBPF、拓扑与策略，启动采集循环与 API 服务。
 async fn run_service(options: &Options) -> anyhow::Result<()> {
-    const PERIODIC_PERSIST_INTERVAL_MS: u64 = 10 * 60 * 1000;
+    const PERIODIC_PERSIST_INTERVAL_MS: u64 = 60 * 1000;
 
     let topology = TopologySnapshot::discover()?;
     let persistence = Arc::new(PersistenceManager::new(&options.data_dir)?);
@@ -123,6 +123,7 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
         policy_runtime: Arc::clone(&policy_runtime),
         topology: Arc::clone(&topology_state),
         persistence: Some(Arc::clone(&persistence)),
+        traffic_enable_storage: options.traffic_enable_storage,
     };
 
     // 解析 TC 后端/顺序并加载 eBPF 实例

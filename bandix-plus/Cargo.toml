@@ -33,6 +33,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1" }
 tower-http = { version = "0.6", features = ["cors"] }
 uuid = { version = "1", features = ["v4"] }
+rusqlite = { version = "0.32", default-features = false, features = ["bundled"] }
 
 
 [build-dependencies]

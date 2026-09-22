@@ -2,6 +2,18 @@ use anyhow::{Context as _, anyhow};
 use aya_build::Toolchain;
 
 fn main() -> anyhow::Result<()> {
+    // Allow unit tests / cargo check without a full eBPF toolchain.
+    if std::env::var_os("AYA_BUILD_SKIP").is_some() {
+        let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR")?);
+        std::fs::create_dir_all(&out_dir)?;
+        let stub = out_dir.join("bandix-plus");
+        if !stub.exists() {
+            std::fs::write(&stub, b"")?;
+        }
+        println!("cargo:warning=AYA_BUILD_SKIP=1; using stub eBPF object");
+        return Ok(());
+    }
+
     let cargo_metadata::Metadata { packages, .. } = cargo_metadata::MetadataCommand::new()
         .no_deps()
         .exec()

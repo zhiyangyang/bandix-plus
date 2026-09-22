@@ -36,6 +36,7 @@ pub struct ApiState {
     pub policy_runtime: Arc<RwLock<PolicyRuntime>>,
     pub topology: Arc<RwLock<TopologySnapshot>>,
     pub persistence: Option<Arc<PersistenceManager>>,
+    pub traffic_enable_storage: bool,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -248,15 +249,69 @@ async fn usage_ranking(
 }
 
 pub async fn start_server(bind_addr: &str, state: ApiState) -> anyhow::Result<()> {
-    let app = router(state);
+    let app = router(state.clone());
     let listener = tokio::net::TcpListener::bind(bind_addr)
         .await
         .map_err(|error| anyhow::anyhow!("failed to bind API server to {bind_addr}: {error}"))?;
     log::info!("API server listening on {bind_addr}");
     axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
         .await
         .map_err(|error| anyhow::anyhow!("API server failed on {bind_addr}: {error}"))?;
+
+    // Best-effort flush on SIGTERM/SIGINT so procd restarts do not lose the current window.
+    if let Err(e) = flush_on_shutdown(&state).await {
+        log::warn!("shutdown flush failed: {e:#}");
+    } else {
+        log::info!("shutdown flush done");
+    }
     Ok(())
+}
+
+async fn flush_on_shutdown(state: &ApiState) -> anyhow::Result<()> {
+    let Some(persistence) = &state.persistence else {
+        return Ok(());
+    };
+    let topology = state.topology.read().await.clone();
+    {
+        let runtime = state.monitor_runtime.read().await;
+        persistence.save_monitor_runtime(&runtime, &topology)?;
+    }
+    if state.traffic_enable_storage {
+        let histogram = state.histogram.read().await;
+        persistence.save_current_hour_histogram(&histogram, &topology)?;
+    }
+    Ok(())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            log::info!("received SIGINT, shutting down");
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut stream) => {
+                stream.recv().await;
+                log::info!("received SIGTERM, shutting down");
+            }
+            Err(e) => {
+                log::warn!("failed to install SIGTERM handler: {e}");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
 }
 
 async fn health() -> Json<ApiEnvelope<&'static str>> {
@@ -1280,6 +1335,7 @@ mod tests {
             policy_runtime: Arc::new(RwLock::new(init_runtime(parse_policy()))),
             topology: Arc::new(RwLock::new(topo)),
             persistence: None,
+            traffic_enable_storage: false,
         }
     }
 

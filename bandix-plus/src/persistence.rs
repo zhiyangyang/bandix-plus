@@ -1,39 +1,31 @@
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
 
 use crate::monitor::{
-    export_runtime_state, import_runtime_state, AggregatedBucket, CurrentHourPointState, HistogramHistory, MonitorRuntime,
-    MonitorRuntimeState,
+    export_runtime_state, import_runtime_state, promote_stale_points_to_bucket, AggregatedBucket, CurrentHourPointState,
+    HistogramHistory, MonitorRuntime, MonitorRuntimeState,
 };
 use crate::policy::{
     export_runtime_state as export_policy_runtime_state, import_runtime_state as import_policy_runtime_state, PolicyRuntime,
     PolicyRuntimeState,
 };
 use crate::topology::TopologySnapshot;
-use crate::utils::time_utils;
 
 const POLICY_SCHEMA_VERSION: u32 = 1;
 const DEVICES_SCHEMA_VERSION: u32 = 1;
-const CURRENT_HOUR_SCHEMA_VERSION: u32 = 1;
+const DB_USER_VERSION: i32 = 1;
 
-const RING_MAGIC: [u8; 8] = *b"BDXPRNG1";
-const RING_VERSION: u32 = 1;
-const RING_SLOT_COUNT: u32 = 365 * 24;
-const RING_HEADER_SIZE: usize = 64;
-const RING_RECORD_DATA_SIZE: usize = 22 * 8;
-const RING_RECORD_SIZE: usize = RING_RECORD_DATA_SIZE + 4;
+const SERIES_IFACE: &str = "iface";
+const SERIES_DEVICE: &str = "device";
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct PersistenceManager {
     data_dir: PathBuf,
-    policy_path: PathBuf,
-    devices_path: PathBuf,
-    current_hour_path: PathBuf,
-    iface_traffic_dir: PathBuf,
-    device_traffic_dir: PathBuf,
+    db_path: PathBuf,
+    conn: Mutex<Connection>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,60 +40,18 @@ struct PersistedDevicesFile {
     state: MonitorRuntimeState,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PersistedCurrentHourFile {
-    schema_version: u32,
-    state: PersistedCurrentHourState,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct PersistedCurrentHourState {
-    iface: Vec<PersistedCurrentHourIface>,
-    device: Vec<PersistedCurrentHourDevice>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PersistedCurrentHourIface {
-    logical_iface: String,
-    hour_start_ts_ms: u64,
-    points: Vec<CurrentHourPointState>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PersistedCurrentHourDevice {
-    logical_iface: String,
-    mac: String,
-    hour_start_ts_ms: u64,
-    points: Vec<CurrentHourPointState>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct RingHeader {
-    slot_count: u32,
-    write_pos: u32,
-    valid_count: u32,
-    record_size: u32,
-}
-
-#[derive(Debug, Clone)]
-struct RingRecord {
-    bucket: AggregatedBucket,
-}
-
 impl PersistenceManager {
     pub fn new(data_dir: impl AsRef<Path>) -> anyhow::Result<Self> {
         let data_dir = data_dir.as_ref().to_path_buf();
-        let iface_traffic_dir = data_dir.join("traffic").join("iface");
-        let device_traffic_dir = data_dir.join("traffic").join("device");
-        fs::create_dir_all(&iface_traffic_dir)?;
-        fs::create_dir_all(&device_traffic_dir)?;
+        std::fs::create_dir_all(&data_dir)?;
+        let db_path = data_dir.join("bandix.db");
+        let conn = Connection::open(&db_path)?;
+        Self::configure(&conn)?;
+        Self::migrate(&conn)?;
         Ok(Self {
-            policy_path: data_dir.join("policy_state.json"),
-            devices_path: data_dir.join("devices_state.json"),
-            current_hour_path: data_dir.join("current_hour_state.json"),
             data_dir,
-            iface_traffic_dir,
-            device_traffic_dir,
+            db_path,
+            conn: Mutex::new(conn),
         })
     }
 
@@ -109,24 +59,141 @@ impl PersistenceManager {
         &self.data_dir
     }
 
+    /// Path to the SQLite database file (`bandix.db` under data_dir).
+    #[allow(dead_code)]
+    pub fn db_path(&self) -> &Path {
+        &self.db_path
+    }
+
+    fn with_conn<F, T>(&self, f: F) -> anyhow::Result<T>
+    where
+        F: FnOnce(&Connection) -> anyhow::Result<T>,
+    {
+        let guard = self.conn.lock().map_err(|_| anyhow::anyhow!("persistence db lock poisoned"))?;
+        f(&guard)
+    }
+
+    fn configure(conn: &Connection) -> anyhow::Result<()> {
+        conn.pragma_update(None, "journal_mode", "DELETE")?;
+        conn.pragma_update(None, "synchronous", "FULL")?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        Ok(())
+    }
+
+    fn migrate(conn: &Connection) -> anyhow::Result<()> {
+        let version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version == DB_USER_VERSION {
+            return Ok(());
+        }
+        if version != 0 {
+            anyhow::bail!("unsupported bandix.db user_version {version}");
+        }
+
+        conn.execute_batch(
+            r#"
+            BEGIN;
+            CREATE TABLE IF NOT EXISTS meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS policy_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                schema_version INTEGER NOT NULL,
+                payload TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS known_devices (
+                logical_iface TEXT NOT NULL,
+                mac TEXT NOT NULL,
+                ipv4 TEXT NOT NULL,
+                ipv6 TEXT NOT NULL,
+                hostname TEXT NOT NULL DEFAULT '',
+                subnet TEXT NOT NULL DEFAULT '',
+                last_seen_ms INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (logical_iface, mac)
+            );
+            CREATE TABLE IF NOT EXISTS traffic_buckets (
+                series_type TEXT NOT NULL,
+                logical_iface TEXT NOT NULL,
+                mac TEXT NOT NULL DEFAULT '',
+                start_ts_ms INTEGER NOT NULL,
+                end_ts_ms INTEGER NOT NULL,
+                up_v4_bytes INTEGER NOT NULL,
+                down_v4_bytes INTEGER NOT NULL,
+                up_v6_bytes INTEGER NOT NULL,
+                down_v6_bytes INTEGER NOT NULL,
+                up_v4_bps_avg INTEGER NOT NULL,
+                up_v4_bps_max INTEGER NOT NULL,
+                up_v4_bps_min INTEGER NOT NULL,
+                up_v4_bps_p95 INTEGER NOT NULL,
+                down_v4_bps_avg INTEGER NOT NULL,
+                down_v4_bps_max INTEGER NOT NULL,
+                down_v4_bps_min INTEGER NOT NULL,
+                down_v4_bps_p95 INTEGER NOT NULL,
+                up_v6_bps_avg INTEGER NOT NULL,
+                up_v6_bps_max INTEGER NOT NULL,
+                up_v6_bps_min INTEGER NOT NULL,
+                up_v6_bps_p95 INTEGER NOT NULL,
+                down_v6_bps_avg INTEGER NOT NULL,
+                down_v6_bps_max INTEGER NOT NULL,
+                down_v6_bps_min INTEGER NOT NULL,
+                down_v6_bps_p95 INTEGER NOT NULL,
+                PRIMARY KEY (series_type, logical_iface, mac, start_ts_ms)
+            ) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS current_hour_points (
+                series_type TEXT NOT NULL,
+                logical_iface TEXT NOT NULL,
+                mac TEXT NOT NULL DEFAULT '',
+                hour_start_ts_ms INTEGER NOT NULL,
+                ts_ms INTEGER NOT NULL,
+                up_v4_bytes INTEGER NOT NULL,
+                down_v4_bytes INTEGER NOT NULL,
+                up_v6_bytes INTEGER NOT NULL,
+                down_v6_bytes INTEGER NOT NULL,
+                up_v4_bps INTEGER NOT NULL,
+                down_v4_bps INTEGER NOT NULL,
+                up_v6_bps INTEGER NOT NULL,
+                down_v6_bps INTEGER NOT NULL,
+                PRIMARY KEY (series_type, logical_iface, mac, ts_ms)
+            ) WITHOUT ROWID;
+            CREATE INDEX IF NOT EXISTS idx_buckets_series_time
+                ON traffic_buckets(series_type, logical_iface, mac, start_ts_ms);
+            CREATE INDEX IF NOT EXISTS idx_current_hour_series
+                ON current_hour_points(series_type, logical_iface, mac, hour_start_ts_ms);
+            PRAGMA user_version = 1;
+            COMMIT;
+            "#,
+        )?;
+        Ok(())
+    }
+
     pub fn save_policy_runtime(&self, runtime: &PolicyRuntime) -> anyhow::Result<()> {
         let data = PersistedPolicyFile {
             schema_version: POLICY_SCHEMA_VERSION,
             state: export_policy_runtime_state(runtime),
         };
-        write_json_atomic(&self.policy_path, &data)
+        let payload = serde_json::to_string(&data)?;
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO policy_state (id, schema_version, payload) VALUES (1, ?1, ?2)
+                 ON CONFLICT(id) DO UPDATE SET schema_version = excluded.schema_version, payload = excluded.payload",
+                params![POLICY_SCHEMA_VERSION as i64, payload],
+            )?;
+            Ok(())
+        })
     }
 
     pub fn load_policy_runtime(&self, runtime: &mut PolicyRuntime, topology: &TopologySnapshot) -> anyhow::Result<()> {
-        let Some(data) = read_json_or_quarantine::<PersistedPolicyFile>(&self.policy_path)? else {
+        let payload: Option<String> = self.with_conn(|conn| {
+            conn.query_row("SELECT payload FROM policy_state WHERE id = 1", [], |row| row.get(0))
+                .optional()
+                .map_err(Into::into)
+        })?;
+        let Some(payload) = payload else {
             return Ok(());
         };
+        let data: PersistedPolicyFile = serde_json::from_str(&payload)?;
         if data.schema_version != POLICY_SCHEMA_VERSION {
-            anyhow::bail!(
-                "unsupported policy schema version {} in {}",
-                data.schema_version,
-                self.policy_path.display()
-            );
+            anyhow::bail!("unsupported policy schema version {}", data.schema_version);
         }
         import_policy_runtime_state(runtime, data.state, topology)
     }
@@ -136,53 +203,140 @@ impl PersistenceManager {
             schema_version: DEVICES_SCHEMA_VERSION,
             state: export_runtime_state(runtime, topology),
         };
-        write_json_atomic(&self.devices_path, &data)
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute("DELETE FROM known_devices", [])?;
+            for dev in &data.state.known_devices {
+                tx.execute(
+                    "INSERT INTO known_devices (logical_iface, mac, ipv4, ipv6, hostname, subnet, last_seen_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        dev.logical_iface,
+                        dev.mac,
+                        serde_json::to_string(&dev.ipv4)?,
+                        serde_json::to_string(&dev.ipv6)?,
+                        dev.hostname,
+                        dev.subnet,
+                        dev.last_seen_ms as i64,
+                    ],
+                )?;
+            }
+            tx.execute(
+                "INSERT INTO meta (key, value) VALUES ('devices_schema_version', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![DEVICES_SCHEMA_VERSION.to_string()],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
     }
 
     pub fn load_monitor_runtime(&self, runtime: &mut MonitorRuntime, topology: &TopologySnapshot) -> anyhow::Result<()> {
-        let Some(data) = read_json_or_quarantine::<PersistedDevicesFile>(&self.devices_path)? else {
-            return Ok(());
-        };
-        if data.schema_version != DEVICES_SCHEMA_VERSION {
-            anyhow::bail!(
-                "unsupported devices schema version {} in {}",
-                data.schema_version,
-                self.devices_path.display()
-            );
-        }
-        import_runtime_state(runtime, data.state, topology)
+        let state = self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT logical_iface, mac, ipv4, ipv6, hostname, subnet, last_seen_ms
+                 FROM known_devices
+                 ORDER BY logical_iface, mac",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            })?;
+
+            let mut state = MonitorRuntimeState { known_devices: Vec::new() };
+            for row in rows {
+                let (logical_iface, mac, ipv4, ipv6, hostname, subnet, last_seen_ms) = row?;
+                state.known_devices.push(crate::monitor::PersistedKnownDevice {
+                    logical_iface,
+                    mac,
+                    ipv4: serde_json::from_str(&ipv4).unwrap_or_default(),
+                    ipv6: serde_json::from_str(&ipv6).unwrap_or_default(),
+                    hostname,
+                    subnet,
+                    last_seen_ms: last_seen_ms.max(0) as u64,
+                });
+            }
+            Ok(state)
+        })?;
+        import_runtime_state(runtime, state, topology)
     }
 
     pub fn save_current_hour_histogram(&self, histogram: &HistogramHistory, topology: &TopologySnapshot) -> anyhow::Result<()> {
         let exported = histogram.export_current_hour_state();
-        let mut iface = Vec::new();
-        for item in exported.iface {
-            let Some(info) = topology.by_ifindex(item.ifindex) else {
-                continue;
-            };
-            iface.push(PersistedCurrentHourIface {
-                logical_iface: info.name.clone(),
-                hour_start_ts_ms: item.hour_start_ts_ms,
-                points: item.points,
-            });
-        }
-        let mut device = Vec::new();
-        for item in exported.device {
-            let Some(info) = topology.by_ifindex(item.ifindex) else {
-                continue;
-            };
-            device.push(PersistedCurrentHourDevice {
-                logical_iface: info.name.clone(),
-                mac: item.mac,
-                hour_start_ts_ms: item.hour_start_ts_ms,
-                points: item.points,
-            });
-        }
-        let data = PersistedCurrentHourFile {
-            schema_version: CURRENT_HOUR_SCHEMA_VERSION,
-            state: PersistedCurrentHourState { iface, device },
-        };
-        write_json_atomic(&self.current_hour_path, &data)
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute("DELETE FROM current_hour_points", [])?;
+
+            for item in &exported.iface {
+                let Some(info) = topology.by_ifindex(item.ifindex) else {
+                    continue;
+                };
+                for p in &item.points {
+                    tx.execute(
+                        "INSERT OR REPLACE INTO current_hour_points (
+                            series_type, logical_iface, mac, hour_start_ts_ms, ts_ms,
+                            up_v4_bytes, down_v4_bytes, up_v6_bytes, down_v6_bytes,
+                            up_v4_bps, down_v4_bps, up_v6_bps, down_v6_bps
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                        params![
+                            SERIES_IFACE,
+                            info.name,
+                            "",
+                            item.hour_start_ts_ms as i64,
+                            p.ts_ms as i64,
+                            p.metrics.up_v4_bytes as i64,
+                            p.metrics.down_v4_bytes as i64,
+                            p.metrics.up_v6_bytes as i64,
+                            p.metrics.down_v6_bytes as i64,
+                            p.metrics.up_v4_bps as i64,
+                            p.metrics.down_v4_bps as i64,
+                            p.metrics.up_v6_bps as i64,
+                            p.metrics.down_v6_bps as i64,
+                        ],
+                    )?;
+                }
+            }
+
+            for item in &exported.device {
+                let Some(info) = topology.by_ifindex(item.ifindex) else {
+                    continue;
+                };
+                for p in &item.points {
+                    tx.execute(
+                        "INSERT OR REPLACE INTO current_hour_points (
+                            series_type, logical_iface, mac, hour_start_ts_ms, ts_ms,
+                            up_v4_bytes, down_v4_bytes, up_v6_bytes, down_v6_bytes,
+                            up_v4_bps, down_v4_bps, up_v6_bps, down_v6_bps
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                        params![
+                            SERIES_DEVICE,
+                            info.name,
+                            item.mac,
+                            item.hour_start_ts_ms as i64,
+                            p.ts_ms as i64,
+                            p.metrics.up_v4_bytes as i64,
+                            p.metrics.down_v4_bytes as i64,
+                            p.metrics.up_v6_bytes as i64,
+                            p.metrics.down_v6_bytes as i64,
+                            p.metrics.up_v4_bps as i64,
+                            p.metrics.down_v4_bps as i64,
+                            p.metrics.up_v6_bps as i64,
+                            p.metrics.down_v6_bps as i64,
+                        ],
+                    )?;
+                }
+            }
+
+            tx.commit()?;
+            Ok(())
+        })
     }
 
     pub fn load_current_hour_histogram(
@@ -191,464 +345,294 @@ impl PersistenceManager {
         histogram: &mut HistogramHistory,
         now_ms: u64,
     ) -> anyhow::Result<()> {
-        let Some(data) = read_json_or_quarantine::<PersistedCurrentHourFile>(&self.current_hour_path)? else {
-            return Ok(());
-        };
-        if data.schema_version != CURRENT_HOUR_SCHEMA_VERSION {
-            anyhow::bail!(
-                "unsupported current-hour schema version {} in {}",
-                data.schema_version,
-                self.current_hour_path.display()
-            );
+        let (expected_start, _) = crate::monitor::hourly_bucket_local(now_ms);
+
+        // Phase 1: read all points under the lock.
+        let series: Vec<(String, String, String, u64, CurrentHourPointState)> = self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT series_type, logical_iface, mac, hour_start_ts_ms, ts_ms,
+                        up_v4_bytes, down_v4_bytes, up_v6_bytes, down_v6_bytes,
+                        up_v4_bps, down_v4_bps, up_v6_bps, down_v6_bps
+                 FROM current_hour_points
+                 ORDER BY series_type, logical_iface, mac, ts_ms",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)? as u64,
+                    row.get::<_, i64>(4)? as u64,
+                    crate::monitor::CounterQuad {
+                        up_v4_bytes: row.get::<_, i64>(5)? as u64,
+                        down_v4_bytes: row.get::<_, i64>(6)? as u64,
+                        up_v6_bytes: row.get::<_, i64>(7)? as u64,
+                        down_v6_bytes: row.get::<_, i64>(8)? as u64,
+                        up_v4_bps: row.get::<_, i64>(9)? as u64,
+                        down_v4_bps: row.get::<_, i64>(10)? as u64,
+                        up_v6_bps: row.get::<_, i64>(11)? as u64,
+                        down_v6_bps: row.get::<_, i64>(12)? as u64,
+                    },
+                ))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (series_type, logical_iface, mac, hour_start, ts_ms, metrics) = row?;
+                out.push((
+                    series_type,
+                    logical_iface,
+                    mac,
+                    hour_start,
+                    CurrentHourPointState { ts_ms, metrics },
+                ));
+            }
+            Ok(out)
+        })?;
+
+        // Group by series key + hour_start so stale hours can be promoted.
+        let mut grouped: Vec<(String, String, String, u64, Vec<CurrentHourPointState>)> = Vec::new();
+        for (series_type, logical_iface, mac, hour_start, point) in series {
+            match grouped
+                .iter_mut()
+                .find(|(st, li, m, h, _)| st == &series_type && li == &logical_iface && m == &mac && h == &hour_start)
+            {
+                Some((_, _, _, _, points)) => points.push(point),
+                None => grouped.push((series_type, logical_iface, mac, hour_start, vec![point])),
+            }
         }
 
-        for item in data.state.iface {
-            let Some(ifindex) = topology.ifindex_by_name(&item.logical_iface) else {
-                continue;
-            };
-            histogram.restore_current_hour_iface_state(ifindex, item.hour_start_ts_ms, item.points, now_ms);
+        // Phase 2: promote/restore and write back under the lock.
+        // Build a list of pending mutations first so we don't hold the lock while mutating histogram.
+        enum Action {
+            RestoreCurrent,
+            Promote(AggregatedBucket),
+            DropOnly,
         }
 
-        for item in data.state.device {
-            let Some(ifindex) = topology.ifindex_by_name(&item.logical_iface) else {
+        let mut planned: Vec<(String, String, String, u64, Vec<CurrentHourPointState>, Action)> = Vec::new();
+        for (series_type, logical_iface, mac, hour_start, points) in grouped {
+            if hour_start == expected_start {
+                planned.push((series_type, logical_iface, mac, hour_start, points, Action::RestoreCurrent));
+            } else if hour_start > expected_start {
+                log::warn!(
+                    "ignoring future current-hour state iface={} hour_start={}",
+                    logical_iface,
+                    hour_start
+                );
+                planned.push((series_type, logical_iface, mac, hour_start, points, Action::DropOnly));
+            } else {
+                match promote_stale_points_to_bucket(hour_start, &points) {
+                    Some(bucket) => planned.push((series_type, logical_iface, mac, hour_start, points, Action::Promote(bucket))),
+                    None => planned.push((series_type, logical_iface, mac, hour_start, points, Action::DropOnly)),
+                }
+            }
+        }
+
+        for (series_type, logical_iface, mac, hour_start, points, action) in planned {
+            let Some(ifindex) = topology.ifindex_by_name(&logical_iface) else {
                 continue;
             };
-            histogram.restore_current_hour_device_state(ifindex, item.mac, item.hour_start_ts_ms, item.points, now_ms);
+
+            match action {
+                Action::RestoreCurrent => {
+                    if series_type == SERIES_IFACE {
+                        histogram.restore_current_hour_iface_state(ifindex, hour_start, points, now_ms);
+                    } else {
+                        histogram.restore_current_hour_device_state(ifindex, mac.clone(), hour_start, points, now_ms);
+                    }
+                }
+                Action::Promote(bucket) => {
+                    self.with_conn(|conn| {
+                        let tx = conn.unchecked_transaction()?;
+                        let already_in_db: bool = tx
+                            .query_row(
+                                "SELECT 1 FROM traffic_buckets
+                                 WHERE series_type = ?1 AND logical_iface = ?2 AND mac = ?3 AND start_ts_ms = ?4",
+                                params![series_type, logical_iface, mac, bucket.start_ts_ms as i64],
+                                |_| Ok(true),
+                            )
+                            .optional()?
+                            .unwrap_or(false);
+                        if !already_in_db {
+                            Self::insert_bucket(&tx, &series_type, &logical_iface, &mac, &bucket)?;
+                        }
+                        tx.execute(
+                            "DELETE FROM current_hour_points WHERE series_type = ?1 AND logical_iface = ?2 AND mac = ?3 AND hour_start_ts_ms = ?4",
+                            params![series_type, logical_iface, mac, hour_start as i64],
+                        )?;
+                        tx.commit()?;
+                        Ok(())
+                    })?;
+
+                    if series_type == SERIES_IFACE {
+                        if !histogram.has_completed_iface_bucket(ifindex, bucket.start_ts_ms) {
+                            histogram.restore_iface_bucket(ifindex, bucket);
+                        }
+                    } else if !histogram.has_completed_device_bucket(ifindex, &mac, bucket.start_ts_ms) {
+                        histogram.restore_device_bucket(ifindex, mac.clone(), bucket);
+                    }
+                }
+                Action::DropOnly => {
+                    self.with_conn(|conn| {
+                        conn.execute(
+                            "DELETE FROM current_hour_points WHERE series_type = ?1 AND logical_iface = ?2 AND mac = ?3 AND hour_start_ts_ms = ?4",
+                            params![series_type, logical_iface, mac, hour_start as i64],
+                        )?;
+                        Ok(())
+                    })?;
+                }
+            }
         }
         Ok(())
     }
 
     pub fn append_iface_bucket(&self, iface_name: &str, bucket: &AggregatedBucket) -> anyhow::Result<()> {
-        let path = self.iface_traffic_dir.join(format!("{}.ring", encode_component(iface_name)));
-        append_ring_record(&path, &RingRecord { bucket: bucket.clone() })
+        self.with_conn(|conn| Self::insert_bucket(conn, SERIES_IFACE, iface_name, "", bucket))
     }
 
     pub fn append_device_bucket(&self, iface_name: &str, mac: &str, bucket: &AggregatedBucket) -> anyhow::Result<()> {
-        let mac_hex = normalize_mac_hex(mac).ok_or_else(|| anyhow::anyhow!("invalid mac for ring path: {}", mac))?;
-        let path = self
-            .device_traffic_dir
-            .join(format!("{}-{}.ring", encode_component(iface_name), mac_hex));
-        append_ring_record(&path, &RingRecord { bucket: bucket.clone() })
+        if normalize_mac_hex(mac).is_none() {
+            anyhow::bail!("invalid mac for bucket: {mac}");
+        }
+        let mac_lower = mac.to_ascii_lowercase();
+        self.with_conn(|conn| Self::insert_bucket(conn, SERIES_DEVICE, iface_name, &mac_lower, bucket))
     }
 
-    /// Delete the completed histogram ring belonging to one device.
     pub fn delete_device_traffic(&self, iface_name: &str, mac: &str) -> anyhow::Result<bool> {
-        let mac_hex = normalize_mac_hex(mac).ok_or_else(|| anyhow::anyhow!("invalid mac for ring path: {}", mac))?;
-        let path = self
-            .device_traffic_dir
-            .join(format!("{}-{}.ring", encode_component(iface_name), mac_hex));
-        if !path.exists() {
-            return Ok(false);
-        }
-        fs::remove_file(path)?;
-        Ok(true)
+        let mac_lower = mac.to_ascii_lowercase();
+        self.with_conn(|conn| {
+            let n = conn.execute(
+                "DELETE FROM traffic_buckets WHERE series_type = ?1 AND logical_iface = ?2 AND mac = ?3",
+                params![SERIES_DEVICE, iface_name, mac_lower],
+            )?;
+            let n2 = conn.execute(
+                "DELETE FROM current_hour_points WHERE series_type = ?1 AND logical_iface = ?2 AND mac = ?3",
+                params![SERIES_DEVICE, iface_name, mac_lower],
+            )?;
+            Ok(n + n2 > 0)
+        })
     }
 
     pub fn load_histogram(&self, topology: &TopologySnapshot, histogram: &mut HistogramHistory) -> anyhow::Result<()> {
-        self.load_iface_histogram(topology, histogram)?;
-        self.load_device_histogram(topology, histogram)?;
-        Ok(())
-    }
+        let rows: Vec<(String, String, String, AggregatedBucket)> = self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT series_type, logical_iface, mac, start_ts_ms, end_ts_ms,
+                        up_v4_bytes, down_v4_bytes, up_v6_bytes, down_v6_bytes,
+                        up_v4_bps_avg, up_v4_bps_max, up_v4_bps_min, up_v4_bps_p95,
+                        down_v4_bps_avg, down_v4_bps_max, down_v4_bps_min, down_v4_bps_p95,
+                        up_v6_bps_avg, up_v6_bps_max, up_v6_bps_min, up_v6_bps_p95,
+                        down_v6_bps_avg, down_v6_bps_max, down_v6_bps_min, down_v6_bps_p95
+                 FROM traffic_buckets
+                 ORDER BY start_ts_ms",
+            )?;
+            let mapped = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    AggregatedBucket {
+                        start_ts_ms: row.get::<_, i64>(3)? as u64,
+                        end_ts_ms: row.get::<_, i64>(4)? as u64,
+                        up_v4_bytes: row.get::<_, i64>(5)? as u64,
+                        down_v4_bytes: row.get::<_, i64>(6)? as u64,
+                        up_v6_bytes: row.get::<_, i64>(7)? as u64,
+                        down_v6_bytes: row.get::<_, i64>(8)? as u64,
+                        up_v4_bps_avg: row.get::<_, i64>(9)? as u64,
+                        up_v4_bps_max: row.get::<_, i64>(10)? as u64,
+                        up_v4_bps_min: row.get::<_, i64>(11)? as u64,
+                        up_v4_bps_p95: row.get::<_, i64>(12)? as u64,
+                        down_v4_bps_avg: row.get::<_, i64>(13)? as u64,
+                        down_v4_bps_max: row.get::<_, i64>(14)? as u64,
+                        down_v4_bps_min: row.get::<_, i64>(15)? as u64,
+                        down_v4_bps_p95: row.get::<_, i64>(16)? as u64,
+                        up_v6_bps_avg: row.get::<_, i64>(17)? as u64,
+                        up_v6_bps_max: row.get::<_, i64>(18)? as u64,
+                        up_v6_bps_min: row.get::<_, i64>(19)? as u64,
+                        up_v6_bps_p95: row.get::<_, i64>(20)? as u64,
+                        down_v6_bps_avg: row.get::<_, i64>(21)? as u64,
+                        down_v6_bps_max: row.get::<_, i64>(22)? as u64,
+                        down_v6_bps_min: row.get::<_, i64>(23)? as u64,
+                        down_v6_bps_p95: row.get::<_, i64>(24)? as u64,
+                    },
+                ))
+            })?;
+            let mut out = Vec::new();
+            for row in mapped {
+                out.push(row?);
+            }
+            Ok(out)
+        })?;
 
-    fn load_iface_histogram(&self, topology: &TopologySnapshot, histogram: &mut HistogramHistory) -> anyhow::Result<()> {
-        if !self.iface_traffic_dir.exists() {
-            return Ok(());
-        }
-        for entry in fs::read_dir(&self.iface_traffic_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if !is_ring_file(&path) {
-                continue;
-            }
-            let Some(stem) = path.file_stem().and_then(|x| x.to_str()) else {
+        for (series_type, logical_iface, mac, bucket) in rows {
+            let Some(ifindex) = topology.ifindex_by_name(&logical_iface) else {
                 continue;
             };
-            let Some(iface_name) = decode_component(stem) else {
-                quarantine_bad_file(&path)?;
-                continue;
-            };
-            let Some(ifindex) = topology.ifindex_by_name(&iface_name) else {
-                continue;
-            };
-            let records = read_ring_records(&path)?;
-            for r in records {
-                histogram.restore_iface_bucket(ifindex, r.bucket);
-            }
-        }
-        Ok(())
-    }
-
-    fn load_device_histogram(&self, topology: &TopologySnapshot, histogram: &mut HistogramHistory) -> anyhow::Result<()> {
-        if !self.device_traffic_dir.exists() {
-            return Ok(());
-        }
-        for entry in fs::read_dir(&self.device_traffic_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if !is_ring_file(&path) {
-                continue;
-            }
-            let Some(stem) = path.file_stem().and_then(|x| x.to_str()) else {
-                continue;
-            };
-            let Some((iface_hex, mac_hex)) = stem.rsplit_once('-') else {
-                quarantine_bad_file(&path)?;
-                continue;
-            };
-            let Some(iface_name) = decode_component(iface_hex) else {
-                quarantine_bad_file(&path)?;
-                continue;
-            };
-            let Some(ifindex) = topology.ifindex_by_name(&iface_name) else {
-                continue;
-            };
-            let Some(mac) = mac_hex_to_colon(mac_hex) else {
-                quarantine_bad_file(&path)?;
-                continue;
-            };
-            let records = read_ring_records(&path)?;
-            for r in records {
-                histogram.restore_device_bucket(ifindex, mac.clone(), r.bucket);
+            if series_type == SERIES_IFACE {
+                histogram.restore_iface_bucket(ifindex, bucket);
+            } else {
+                histogram.restore_device_bucket(ifindex, mac, bucket);
             }
         }
         Ok(())
     }
-}
 
-fn write_json_atomic<T: Serialize>(path: &Path, data: &T) -> anyhow::Result<()> {
-    let Some(parent) = path.parent() else {
-        anyhow::bail!("invalid path without parent: {}", path.display());
-    };
-    fs::create_dir_all(parent)?;
-
-    let tmp = path.with_extension(format!("tmp.{}", time_utils::now_millis()));
-    let payload = serde_json::to_vec_pretty(data)?;
-
-    {
-        let mut f = File::create(&tmp)?;
-        f.write_all(&payload)?;
-        f.sync_all()?;
+    #[cfg(test)]
+    fn execute_for_test(&self, sql: &str, params: &[&dyn rusqlite::ToSql]) -> anyhow::Result<usize> {
+        self.with_conn(|conn| Ok(conn.execute(sql, params)?))
     }
 
-    fs::rename(&tmp, path)?;
-    Ok(())
-}
-
-fn read_json_or_quarantine<T: DeserializeOwned>(path: &Path) -> anyhow::Result<Option<T>> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    let bytes = match fs::read(path) {
-        Ok(v) => v,
-        Err(e) => {
-            quarantine_bad_file(path)?;
-            anyhow::bail!("failed to read {}: {}", path.display(), e);
-        }
-    };
-    let parsed = serde_json::from_slice::<T>(&bytes);
-    match parsed {
-        Ok(v) => Ok(Some(v)),
-        Err(_) => {
-            quarantine_bad_file(path)?;
-            Ok(None)
-        }
-    }
-}
-
-fn append_ring_record(path: &Path, record: &RingRecord) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+    #[cfg(test)]
+    fn query_i64_for_test(&self, sql: &str) -> anyhow::Result<i64> {
+        self.with_conn(|conn| Ok(conn.query_row(sql, [], |r| r.get(0))?))
     }
 
-    let mut file = open_or_create_ring(path)?;
-    let mut header = read_ring_header(&mut file)?;
-    let slot = (header.write_pos % header.slot_count) as usize;
-
-    let record_offset = ring_data_offset(slot as u32);
-    file.seek(SeekFrom::Start(record_offset))?;
-    let encoded = encode_ring_record(record)?;
-    file.write_all(&encoded)?;
-
-    header.write_pos = (slot as u32 + 1) % header.slot_count;
-    header.valid_count = (header.valid_count + 1).min(header.slot_count);
-
-    write_ring_header(&mut file, &header)?;
-    file.sync_data()?;
-    Ok(())
-}
-
-fn read_ring_records(path: &Path) -> anyhow::Result<Vec<RingRecord>> {
-    let mut file = match OpenOptions::new().read(true).open(path) {
-        Ok(f) => f,
-        Err(e) => {
-            quarantine_bad_file(path)?;
-            anyhow::bail!("failed to open ring {}: {}", path.display(), e);
-        }
-    };
-    let header = match read_ring_header(&mut file) {
-        Ok(h) => h,
-        Err(_) => {
-            quarantine_bad_file(path)?;
-            return Ok(Vec::new());
-        }
-    };
-    let file_len = file.metadata()?.len();
-    let (min_expected, max_expected) = match ring_size_bounds(&header) {
-        Ok(v) => v,
-        Err(_) => {
-            quarantine_bad_file(path)?;
-            return Ok(Vec::new());
-        }
-    };
-    if file_len < min_expected || file_len > max_expected {
-        quarantine_bad_file(path)?;
-        return Ok(Vec::new());
+    fn insert_bucket(conn: &Connection, series_type: &str, iface: &str, mac: &str, b: &AggregatedBucket) -> anyhow::Result<()> {
+        conn.execute(
+            "INSERT OR IGNORE INTO traffic_buckets (
+                series_type, logical_iface, mac, start_ts_ms, end_ts_ms,
+                up_v4_bytes, down_v4_bytes, up_v6_bytes, down_v6_bytes,
+                up_v4_bps_avg, up_v4_bps_max, up_v4_bps_min, up_v4_bps_p95,
+                down_v4_bps_avg, down_v4_bps_max, down_v4_bps_min, down_v4_bps_p95,
+                up_v6_bps_avg, up_v6_bps_max, up_v6_bps_min, up_v6_bps_p95,
+                down_v6_bps_avg, down_v6_bps_max, down_v6_bps_min, down_v6_bps_p95
+             ) VALUES (
+                ?1, ?2, ?3, ?4, ?5,
+                ?6, ?7, ?8, ?9,
+                ?10, ?11, ?12, ?13,
+                ?14, ?15, ?16, ?17,
+                ?18, ?19, ?20, ?21,
+                ?22, ?23, ?24, ?25
+             )",
+            params![
+                series_type,
+                iface,
+                mac,
+                b.start_ts_ms as i64,
+                b.end_ts_ms as i64,
+                b.up_v4_bytes as i64,
+                b.down_v4_bytes as i64,
+                b.up_v6_bytes as i64,
+                b.down_v6_bytes as i64,
+                b.up_v4_bps_avg as i64,
+                b.up_v4_bps_max as i64,
+                b.up_v4_bps_min as i64,
+                b.up_v4_bps_p95 as i64,
+                b.down_v4_bps_avg as i64,
+                b.down_v4_bps_max as i64,
+                b.down_v4_bps_min as i64,
+                b.down_v4_bps_p95 as i64,
+                b.up_v6_bps_avg as i64,
+                b.up_v6_bps_max as i64,
+                b.up_v6_bps_min as i64,
+                b.up_v6_bps_p95 as i64,
+                b.down_v6_bps_avg as i64,
+                b.down_v6_bps_max as i64,
+                b.down_v6_bps_min as i64,
+                b.down_v6_bps_p95 as i64,
+            ],
+        )?;
+        Ok(())
     }
-
-    let mut out = Vec::with_capacity(header.valid_count as usize);
-    let start_idx = (header.write_pos + header.slot_count - header.valid_count) % header.slot_count;
-    for i in 0..header.valid_count {
-        let idx = (start_idx + i) % header.slot_count;
-        let offset = ring_data_offset(idx);
-        let end = offset.saturating_add(header.record_size as u64);
-        if end > file_len {
-            quarantine_bad_file(path)?;
-            return Ok(Vec::new());
-        }
-        file.seek(SeekFrom::Start(offset))?;
-
-        let mut buf = vec![0u8; header.record_size as usize];
-        file.read_exact(&mut buf)?;
-        let record = match decode_ring_record(&buf) {
-            Ok(r) => r,
-            Err(_) => {
-                quarantine_bad_file(path)?;
-                return Ok(Vec::new());
-            }
-        };
-        out.push(record);
-    }
-    Ok(out)
-}
-
-fn open_or_create_ring(path: &Path) -> anyhow::Result<File> {
-    if !path.exists() {
-        let mut f = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path)?;
-        let header = default_ring_header();
-        write_ring_header(&mut f, &header)?;
-        return Ok(f);
-    }
-
-    let mut f = OpenOptions::new().read(true).write(true).open(path)?;
-    let header = match read_ring_header(&mut f) {
-        Ok(v) => v,
-        Err(_) => {
-            quarantine_bad_file(path)?;
-            return open_or_create_ring(path);
-        }
-    };
-    let (min_expected, max_expected) = ring_size_bounds(&header)?;
-    let actual = f.metadata()?.len();
-    if actual < min_expected || actual > max_expected {
-        quarantine_bad_file(path)?;
-        return open_or_create_ring(path);
-    }
-    Ok(f)
-}
-
-fn default_ring_header() -> RingHeader {
-    RingHeader {
-        slot_count: RING_SLOT_COUNT,
-        write_pos: 0,
-        valid_count: 0,
-        record_size: RING_RECORD_SIZE as u32,
-    }
-}
-
-fn ring_total_size(header: &RingHeader) -> usize {
-    RING_HEADER_SIZE + header.slot_count as usize * header.record_size as usize
-}
-
-fn ring_min_size(header: &RingHeader) -> anyhow::Result<usize> {
-    let prefix = RING_HEADER_SIZE;
-    if header.valid_count == 0 {
-        return Ok(prefix);
-    }
-    if header.valid_count < header.slot_count {
-        if header.write_pos != header.valid_count {
-            anyhow::bail!(
-                "invalid ring header for non-full ring write_pos={} valid_count={}",
-                header.write_pos,
-                header.valid_count
-            );
-        }
-        return Ok(prefix + header.valid_count as usize * header.record_size as usize);
-    }
-    Ok(prefix + header.slot_count as usize * header.record_size as usize)
-}
-
-fn ring_size_bounds(header: &RingHeader) -> anyhow::Result<(u64, u64)> {
-    let min = ring_min_size(header)? as u64;
-    let max = ring_total_size(header) as u64;
-    Ok((min, max))
-}
-
-fn ring_data_offset(slot_idx: u32) -> u64 {
-    (RING_HEADER_SIZE + slot_idx as usize * RING_RECORD_SIZE) as u64
-}
-
-fn write_ring_header(file: &mut File, header: &RingHeader) -> anyhow::Result<()> {
-    let mut buf = vec![0u8; RING_HEADER_SIZE];
-    buf[0..8].copy_from_slice(&RING_MAGIC);
-    buf[8..12].copy_from_slice(&RING_VERSION.to_le_bytes());
-    buf[12..16].copy_from_slice(&header.slot_count.to_le_bytes());
-    buf[16..20].copy_from_slice(&header.write_pos.to_le_bytes());
-    buf[20..24].copy_from_slice(&header.valid_count.to_le_bytes());
-    buf[24..28].copy_from_slice(&header.record_size.to_le_bytes());
-    let sum = checksum32(&buf[0..28]);
-    buf[28..32].copy_from_slice(&sum.to_le_bytes());
-
-    file.seek(SeekFrom::Start(0))?;
-    file.write_all(&buf)?;
-    Ok(())
-}
-
-fn read_ring_header(file: &mut File) -> anyhow::Result<RingHeader> {
-    let mut buf = vec![0u8; RING_HEADER_SIZE];
-    file.seek(SeekFrom::Start(0))?;
-    file.read_exact(&mut buf)?;
-
-    if buf[0..8] != RING_MAGIC {
-        anyhow::bail!("invalid ring magic");
-    }
-    let version = u32::from_le_bytes(buf[8..12].try_into().unwrap());
-    if version != RING_VERSION {
-        anyhow::bail!("unsupported ring version {}", version);
-    }
-    let checksum = u32::from_le_bytes(buf[28..32].try_into().unwrap());
-    let expected = checksum32(&buf[0..28]);
-    if checksum != expected {
-        anyhow::bail!("invalid ring header checksum");
-    }
-
-    let slot_count = u32::from_le_bytes(buf[12..16].try_into().unwrap());
-    let write_pos = u32::from_le_bytes(buf[16..20].try_into().unwrap());
-    let valid_count = u32::from_le_bytes(buf[20..24].try_into().unwrap());
-    let record_size = u32::from_le_bytes(buf[24..28].try_into().unwrap());
-
-    if slot_count == 0 || record_size as usize != RING_RECORD_SIZE {
-        anyhow::bail!("invalid ring header values");
-    }
-    if write_pos >= slot_count || valid_count > slot_count {
-        anyhow::bail!("invalid ring positions");
-    }
-
-    Ok(RingHeader {
-        slot_count,
-        write_pos,
-        valid_count,
-        record_size,
-    })
-}
-
-fn encode_ring_record(record: &RingRecord) -> anyhow::Result<Vec<u8>> {
-    let b = &record.bucket;
-    let mut data = Vec::with_capacity(RING_RECORD_DATA_SIZE);
-    for v in [
-        b.start_ts_ms,
-        b.end_ts_ms,
-        b.up_v4_bytes,
-        b.down_v4_bytes,
-        b.up_v6_bytes,
-        b.down_v6_bytes,
-        b.up_v4_bps_avg,
-        b.up_v4_bps_max,
-        b.up_v4_bps_min,
-        b.up_v4_bps_p95,
-        b.down_v4_bps_avg,
-        b.down_v4_bps_max,
-        b.down_v4_bps_min,
-        b.down_v4_bps_p95,
-        b.up_v6_bps_avg,
-        b.up_v6_bps_max,
-        b.up_v6_bps_min,
-        b.up_v6_bps_p95,
-        b.down_v6_bps_avg,
-        b.down_v6_bps_max,
-        b.down_v6_bps_min,
-        b.down_v6_bps_p95,
-    ] {
-        data.extend_from_slice(&v.to_le_bytes());
-    }
-    if data.len() != RING_RECORD_DATA_SIZE {
-        anyhow::bail!("unexpected ring record size");
-    }
-    let checksum = checksum32(&data);
-    data.extend_from_slice(&checksum.to_le_bytes());
-    Ok(data)
-}
-
-fn decode_ring_record(data: &[u8]) -> anyhow::Result<RingRecord> {
-    if data.len() != RING_RECORD_SIZE {
-        anyhow::bail!("invalid ring record length");
-    }
-    let checksum = u32::from_le_bytes(data[RING_RECORD_DATA_SIZE..RING_RECORD_SIZE].try_into().unwrap());
-    let expected = checksum32(&data[0..RING_RECORD_DATA_SIZE]);
-    if checksum != expected {
-        anyhow::bail!("ring record checksum mismatch");
-    }
-
-    let mut offset = 0usize;
-    let mut next = || {
-        let v = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
-        offset += 8;
-        v
-    };
-
-    let bucket = AggregatedBucket {
-        start_ts_ms: next(),
-        end_ts_ms: next(),
-        up_v4_bytes: next(),
-        down_v4_bytes: next(),
-        up_v6_bytes: next(),
-        down_v6_bytes: next(),
-        up_v4_bps_avg: next(),
-        up_v4_bps_max: next(),
-        up_v4_bps_min: next(),
-        up_v4_bps_p95: next(),
-        down_v4_bps_avg: next(),
-        down_v4_bps_max: next(),
-        down_v4_bps_min: next(),
-        down_v4_bps_p95: next(),
-        up_v6_bps_avg: next(),
-        up_v6_bps_max: next(),
-        up_v6_bps_min: next(),
-        up_v6_bps_p95: next(),
-        down_v6_bps_avg: next(),
-        down_v6_bps_max: next(),
-        down_v6_bps_min: next(),
-        down_v6_bps_p95: next(),
-    };
-
-    Ok(RingRecord { bucket })
-}
-
-fn checksum32(data: &[u8]) -> u32 {
-    let mut hash: u32 = 0x811c9dc5;
-    for b in data {
-        hash ^= *b as u32;
-        hash = hash.wrapping_mul(0x01000193);
-    }
-    hash
-}
-
-fn is_ring_file(path: &Path) -> bool {
-    path.extension().and_then(|x| x.to_str()) == Some("ring")
 }
 
 fn normalize_mac_hex(mac: &str) -> Option<String> {
@@ -659,58 +643,18 @@ fn normalize_mac_hex(mac: &str) -> Option<String> {
     Some(compact)
 }
 
-fn mac_hex_to_colon(hex: &str) -> Option<String> {
-    if hex.len() != 12 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
-        return None;
-    }
-    let mut parts = Vec::with_capacity(6);
-    for i in 0..6 {
-        parts.push(hex[i * 2..i * 2 + 2].to_ascii_lowercase());
-    }
-    Some(parts.join(":"))
-}
-
-fn encode_component(input: &str) -> String {
-    let mut out = String::with_capacity(input.len() * 2);
-    for b in input.as_bytes() {
-        out.push_str(&format!("{:02x}", b));
-    }
-    out
-}
-
-fn decode_component(hex: &str) -> Option<String> {
-    if hex.is_empty() || hex.len() % 2 != 0 {
-        return None;
-    }
-    let mut bytes = Vec::with_capacity(hex.len() / 2);
-    let chars: Vec<char> = hex.chars().collect();
-    for i in (0..chars.len()).step_by(2) {
-        let hi = chars[i];
-        let lo = chars[i + 1];
-        let s = [hi, lo].iter().collect::<String>();
-        let v = u8::from_str_radix(&s, 16).ok()?;
-        bytes.push(v);
-    }
-    String::from_utf8(bytes).ok()
-}
-
-fn quarantine_bad_file(path: &Path) -> anyhow::Result<()> {
-    if !path.exists() {
-        return Ok(());
-    }
-    let file_name = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .ok_or_else(|| anyhow::anyhow!("invalid filename for {}", path.display()))?;
-    let bad_name = format!("{}.bad.{}", file_name, time_utils::now_millis());
-    let bad_path = path.with_file_name(bad_name);
-    fs::rename(path, bad_path)?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::monitor::CounterQuad;
+    use crate::utils::time_utils;
+    use chrono::TimeZone;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("bandix-plus-sqlite-{}-{}", tag, time_utils::now_millis()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
     fn sample_bucket(start: u64) -> AggregatedBucket {
         AggregatedBucket {
@@ -739,49 +683,200 @@ mod tests {
         }
     }
 
-    #[test]
-    fn ring_wrap_keeps_recent_records() {
-        let dir = std::env::temp_dir().join(format!("bandix-plus-ring-test-{}", time_utils::now_millis()));
-        fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("x.ring");
-
-        for i in 0..(RING_SLOT_COUNT as usize + 10) {
-            append_ring_record(
-                &file,
-                &RingRecord {
-                    bucket: sample_bucket(i as u64),
-                },
-            )
-            .unwrap();
-        }
-
-        let records = read_ring_records(&file).unwrap();
-        assert_eq!(records.len(), RING_SLOT_COUNT as usize);
-        assert_eq!(records.first().unwrap().bucket.start_ts_ms, 10);
-        assert_eq!(
-            records.last().unwrap().bucket.start_ts_ms,
-            (RING_SLOT_COUNT as usize + 9) as u64
-        );
-
-        let _ = fs::remove_dir_all(dir);
+    fn mock_topology() -> TopologySnapshot {
+        use crate::topology::Interface;
+        use crate::utils::system_utils::InterfaceRole;
+        TopologySnapshot::from_interfaces(vec![
+            Interface {
+                ifindex: 1,
+                name: "br-lan".to_string(),
+                role: InterfaceRole::Bridge,
+                zone: "lan".to_string(),
+                parent_ifindex: None,
+                ipv4_cidrs: vec!["192.168.1.1/24".to_string()],
+                ipv6_cidrs: vec![],
+            },
+            Interface {
+                ifindex: 2,
+                name: "eth0".to_string(),
+                role: InterfaceRole::Ethernet,
+                zone: "unknown".to_string(),
+                parent_ifindex: None,
+                ipv4_cidrs: vec![],
+                ipv6_cidrs: vec![],
+            },
+        ])
     }
 
     #[test]
-    fn ring_grows_on_demand_instead_of_preallocating_full_size() {
-        let dir = std::env::temp_dir().join(format!("bandix-plus-ring-grow-test-{}", time_utils::now_millis()));
-        fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("x.ring");
+    fn creates_schema_and_reopens() {
+        let dir = temp_dir("schema");
+        {
+            let p = PersistenceManager::new(&dir).unwrap();
+            assert!(p.db_path().exists());
+        }
+        let p2 = PersistenceManager::new(&dir).unwrap();
+        assert!(p2.db_path().exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
-        append_ring_record(&file, &RingRecord { bucket: sample_bucket(1) }).unwrap();
+    #[test]
+    fn append_bucket_is_idempotent() {
+        let dir = temp_dir("idempotent");
+        let p = PersistenceManager::new(&dir).unwrap();
+        let topo = mock_topology();
+        let mut h = HistogramHistory::new();
 
-        let size_after_one = fs::metadata(&file).unwrap().len();
-        assert_eq!(size_after_one, (RING_HEADER_SIZE + RING_RECORD_SIZE) as u64);
-        assert!(size_after_one < ring_total_size(&default_ring_header()) as u64);
+        p.append_iface_bucket("br-lan", &sample_bucket(1_000)).unwrap();
+        p.append_iface_bucket("br-lan", &sample_bucket(1_000)).unwrap();
+        p.append_iface_bucket("br-lan", &sample_bucket(2_000)).unwrap();
 
-        append_ring_record(&file, &RingRecord { bucket: sample_bucket(2) }).unwrap();
-        let size_after_two = fs::metadata(&file).unwrap().len();
-        assert_eq!(size_after_two, (RING_HEADER_SIZE + 2 * RING_RECORD_SIZE) as u64);
+        p.load_histogram(&topo, &mut h).unwrap();
+        let all = h.query_aggregate(1, None, 0, u64::MAX, crate::monitor::AggregateBucket::Hourly);
+        assert_eq!(all.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
-        let _ = fs::remove_dir_all(dir);
+    #[test]
+    fn append_and_load_device_bucket() {
+        let dir = temp_dir("device");
+        let p = PersistenceManager::new(&dir).unwrap();
+        let topo = mock_topology();
+        let mut h = HistogramHistory::new();
+        let b = sample_bucket(10_000);
+        p.append_device_bucket("eth0", "AA:BB:CC:DD:EE:FF", &b).unwrap();
+        p.load_histogram(&topo, &mut h).unwrap();
+        let all = h.query_aggregate(2, Some("aa:bb:cc:dd:ee:ff"), 0, u64::MAX, crate::monitor::AggregateBucket::Hourly);
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].up_v4_bytes, 1);
+
+        assert!(p.delete_device_traffic("eth0", "aa:bb:cc:dd:ee:ff").unwrap());
+        let mut h2 = HistogramHistory::new();
+        p.load_histogram(&topo, &mut h2).unwrap();
+        assert!(h2
+            .query_aggregate(2, Some("aa:bb:cc:dd:ee:ff"), 0, u64::MAX, crate::monitor::AggregateBucket::Hourly)
+            .is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_current_hour_promotes_to_completed() {
+        let dir = temp_dir("stale");
+        let p = PersistenceManager::new(&dir).unwrap();
+        let topo = mock_topology();
+
+        // now is 11:05, saved hour is 10:00
+        let now = chrono::Local.with_ymd_and_hms(2024, 1, 15, 11, 5, 0).unwrap().timestamp_millis() as u64;
+        let old = chrono::Local.with_ymd_and_hms(2024, 1, 15, 10, 5, 0).unwrap().timestamp_millis() as u64;
+        let (old_start, _) = crate::monitor::hourly_bucket_local(old);
+
+        // Save as current hour relative to a fake "old now" so rows land with hour_start=old_start
+        let mut h_write = HistogramHistory::new();
+        h_write.restore_current_hour_iface_state(
+            1,
+            old_start,
+            vec![CurrentHourPointState {
+                ts_ms: old,
+                metrics: CounterQuad {
+                    up_v4_bytes: 99,
+                    ..CounterQuad::default()
+                },
+            }],
+            old, // treat old hour as current when saving
+        );
+        p.save_current_hour_histogram(&h_write, &topo).unwrap();
+
+        // Load with now in next hour -> should promote, not drop
+        let mut h = HistogramHistory::new();
+        p.load_current_hour_histogram(&topo, &mut h, now).unwrap();
+        let all = h.query_aggregate(1, None, 0, u64::MAX, crate::monitor::AggregateBucket::Hourly);
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].up_v4_bytes, 99);
+        assert_eq!(all[0].start_ts_ms, old_start);
+
+        // Second startup: load_histogram first (as command.rs does), then current-hour.
+        // Must not double-count the promoted bucket.
+        let mut h2 = HistogramHistory::new();
+        p.load_histogram(&topo, &mut h2).unwrap();
+        p.load_current_hour_histogram(&topo, &mut h2, now + 3_600_000).unwrap();
+        let (cum, _) = h2.cumulative_from_all();
+        assert_eq!(cum.get(&1).map(|x| x.up_v4_bytes), Some(99));
+
+        // current_hour_points for stale hour should be gone
+        let remaining = p.query_i64_for_test("SELECT COUNT(*) FROM current_hour_points").unwrap();
+        assert_eq!(remaining, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn current_hour_restores_into_current_slot() {
+        let dir = temp_dir("current");
+        let p = PersistenceManager::new(&dir).unwrap();
+        let topo = mock_topology();
+        let now = chrono::Local.with_ymd_and_hms(2024, 1, 15, 10, 30, 0).unwrap().timestamp_millis() as u64;
+        let (start, _) = crate::monitor::hourly_bucket_local(now);
+
+        let mut h_write = HistogramHistory::new();
+        h_write.restore_current_hour_iface_state(
+            1,
+            start,
+            vec![CurrentHourPointState {
+                ts_ms: now,
+                metrics: CounterQuad {
+                    up_v4_bytes: 7,
+                    ..CounterQuad::default()
+                },
+            }],
+            now,
+        );
+        p.save_current_hour_histogram(&h_write, &topo).unwrap();
+
+        let mut h = HistogramHistory::new();
+        p.load_current_hour_histogram(&topo, &mut h, now).unwrap();
+        let (cum, _) = h.cumulative_from_all();
+        assert_eq!(cum.get(&1).map(|x| x.up_v4_bytes), Some(7));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn future_current_hour_is_ignored() {
+        let dir = temp_dir("future");
+        let p = PersistenceManager::new(&dir).unwrap();
+        let topo = mock_topology();
+        let now = chrono::Local.with_ymd_and_hms(2024, 1, 15, 10, 0, 0).unwrap().timestamp_millis() as u64;
+        let future = now + 3_600_000;
+        let (future_start, _) = crate::monitor::hourly_bucket_local(future);
+
+        // Manually insert future points
+        let sql = "INSERT INTO current_hour_points (
+            series_type, logical_iface, mac, hour_start_ts_ms, ts_ms,
+            up_v4_bytes, down_v4_bytes, up_v6_bytes, down_v6_bytes,
+            up_v4_bps, down_v4_bps, up_v6_bps, down_v6_bps
+         ) VALUES ('iface', 'br-lan', '', ?1, ?2, 5, 0, 0, 0, 0, 0, 0, 0)";
+        let a = future_start as i64;
+        let b = future as i64;
+        p.execute_for_test(sql, &[&a, &b]).unwrap();
+
+        let mut h = HistogramHistory::new();
+        p.load_current_hour_histogram(&topo, &mut h, now).unwrap();
+        let all = h.query_aggregate(1, None, 0, u64::MAX, crate::monitor::AggregateBucket::Hourly);
+        assert!(all.is_empty());
+
+        let remaining = p.query_i64_for_test("SELECT COUNT(*) FROM current_hour_points").unwrap();
+        assert_eq!(remaining, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn policy_roundtrip() {
+        let dir = temp_dir("policy");
+        let p = PersistenceManager::new(&dir).unwrap();
+        let topo = mock_topology();
+        let mut rt = crate::policy::init_runtime(crate::policy::parse_policy());
+        p.save_policy_runtime(&rt).unwrap();
+        let mut rt2 = crate::policy::init_runtime(crate::policy::parse_policy());
+        p.load_policy_runtime(&mut rt2, &topo).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

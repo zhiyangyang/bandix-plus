@@ -283,7 +283,7 @@ fn daily_bucket_local(ts_ms: u64) -> (u64, u64) {
     (start_ts, end_ts)
 }
 
-fn hourly_bucket_local(ts_ms: u64) -> (u64, u64) {
+pub(crate) fn hourly_bucket_local(ts_ms: u64) -> (u64, u64) {
     let dt = match Local.timestamp_millis_opt(ts_ms as i64) {
         chrono::LocalResult::Single(t) => t,
         _ => return (0, 0),
@@ -432,6 +432,21 @@ impl HistogramHistory {
         if let Some(q) = self.completed_device.get_mut(&key) {
             trim_histogram_completed(q, HISTOGRAM_MAX_HOURS);
         }
+    }
+
+    pub fn has_completed_iface_bucket(&self, ifindex: u32, start_ts_ms: u64) -> bool {
+        self.completed_iface
+            .get(&ifindex)
+            .map(|q| q.iter().any(|b| b.start_ts_ms == start_ts_ms))
+            .unwrap_or(false)
+    }
+
+    pub fn has_completed_device_bucket(&self, ifindex: u32, mac: &str, start_ts_ms: u64) -> bool {
+        self.completed_device.iter().any(|(k, q)| {
+            k.ifindex == ifindex
+                && k.mac.eq_ignore_ascii_case(mac)
+                && q.iter().any(|b| b.start_ts_ms == start_ts_ms)
+        })
     }
 
     pub fn export_current_hour_state(&self) -> CurrentHourState {
@@ -734,6 +749,29 @@ fn normalize_current_hour_points(
     }
 
     Some((hour_start_ts_ms, restored))
+}
+
+/// Promote a stale (already-completed) hour's points into an AggregatedBucket.
+pub(crate) fn promote_stale_points_to_bucket(hour_start_ts_ms: u64, points: &[CurrentHourPointState]) -> Option<AggregatedBucket> {
+    let (expected_start, expected_end) = hourly_bucket_local(hour_start_ts_ms);
+    if hour_start_ts_ms != expected_start {
+        return None;
+    }
+    let mut restored: Vec<HistoryPoint> = points
+        .iter()
+        .filter(|p| p.ts_ms >= expected_start && p.ts_ms <= expected_end)
+        .map(|p| HistoryPoint {
+            ts_ms: p.ts_ms,
+            metrics: p.metrics,
+            cumulative: CounterQuad::default(),
+        })
+        .collect();
+    if restored.is_empty() {
+        return None;
+    }
+    restored.sort_by_key(|p| p.ts_ms);
+    restored.dedup_by_key(|p| p.ts_ms);
+    Some(points_to_bucket(hour_start_ts_ms, &restored))
 }
 
 fn points_to_bucket(start_ms: u64, points: &[HistoryPoint]) -> AggregatedBucket {
@@ -1399,7 +1437,8 @@ mod aggregated_bucket_tests {
 #[cfg(test)]
 mod boundary_tests {
     use super::{
-        daily_bucket_local, hourly_bucket_local, AggregateBucket, AggregatedBucket, CounterQuad, CurrentHourPointState, HistogramHistory,
+        daily_bucket_local, hourly_bucket_local, promote_stale_points_to_bucket, AggregateBucket, AggregatedBucket, CounterQuad,
+        CurrentHourPointState, HistogramHistory,
     };
     use chrono::{Local, TimeZone};
 
@@ -1550,10 +1589,45 @@ mod boundary_tests {
             now,
         );
 
+        // Direct restore only accepts the current hour; stale hours must go through promote.
         let all = h.query_aggregate(7, None, 0, u64::MAX, AggregateBucket::Hourly);
         assert!(all.is_empty());
 
         let (iface_cum, _) = h.cumulative_from_all();
         assert!(iface_cum.get(&7).is_none());
+    }
+
+    #[test]
+    fn promote_stale_points_builds_completed_bucket() {
+        let now = Local.with_ymd_and_hms(2024, 1, 15, 11, 5, 0).unwrap().timestamp_millis() as u64;
+        let old = Local.with_ymd_and_hms(2024, 1, 15, 10, 5, 0).unwrap().timestamp_millis() as u64;
+        let (old_start, old_end) = hourly_bucket_local(old);
+
+        let bucket = promote_stale_points_to_bucket(
+            old_start,
+            &[CurrentHourPointState {
+                ts_ms: old_end,
+                metrics: CounterQuad {
+                    up_v4_bytes: 99,
+                    ..CounterQuad::default()
+                },
+            }],
+        )
+        .expect("stale hour should promote");
+
+        assert_eq!(bucket.start_ts_ms, old_start);
+        assert_eq!(bucket.end_ts_ms, old_end);
+        assert_eq!(bucket.up_v4_bytes, 99);
+
+        let mut h = HistogramHistory::new();
+        h.restore_iface_bucket(7, bucket.clone());
+        let all = h.query_aggregate(7, None, 0, u64::MAX, AggregateBucket::Hourly);
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].up_v4_bytes, 99);
+
+        // Dedup path
+        assert!(h.has_completed_iface_bucket(7, bucket.start_ts_ms));
+        assert!(!h.has_completed_iface_bucket(7, bucket.start_ts_ms + 1));
+        let _ = now;
     }
 }
