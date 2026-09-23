@@ -61,6 +61,13 @@ pub struct Options {
     )]
     pub traffic_enable_storage: bool,
 
+    #[arg(
+        long = "traffic-retention-days",
+        default_value_t = 366,
+        help = "Days of hourly traffic buckets to keep in SQLite when storage is enabled (0 = keep forever)"
+    )]
+    pub traffic_retention_days: u32,
+
     #[arg(short, long, help = "Network interface to monitor (can specify multiple times)")]
     pub iface: Vec<String>,
 

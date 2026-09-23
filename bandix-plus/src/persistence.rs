@@ -77,6 +77,8 @@ impl PersistenceManager {
         conn.pragma_update(None, "journal_mode", "DELETE")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        // Best-effort: only takes effect on empty/new DBs; ignored failures on old files.
+        let _ = conn.pragma_update(None, "auto_vacuum", "INCREMENTAL");
         Ok(())
     }
 
@@ -498,6 +500,36 @@ impl PersistenceManager {
         self.with_conn(|conn| Self::insert_bucket(conn, SERIES_DEVICE, iface_name, &mac_lower, bucket))
     }
 
+    /// Delete hourly buckets older than `retention_days`. `0` disables pruning.
+    /// Returns the number of deleted rows.
+    pub fn prune_traffic_buckets(&self, retention_days: u32, now_ms: u64) -> anyhow::Result<usize> {
+        if retention_days == 0 {
+            return Ok(0);
+        }
+        let retention_ms = u64::from(retention_days)
+            .saturating_mul(24)
+            .saturating_mul(60)
+            .saturating_mul(60)
+            .saturating_mul(1000);
+        let cutoff = now_ms.saturating_sub(retention_ms) as i64;
+        self.with_conn(|conn| {
+            let deleted = conn.execute("DELETE FROM traffic_buckets WHERE start_ts_ms < ?1", params![cutoff])?;
+            Ok(deleted)
+        })
+    }
+
+    /// Incrementally reclaim free pages after pruning (safe for flash; no full rewrite).
+    pub fn incremental_vacuum(&self, pages: i64) -> anyhow::Result<()> {
+        if pages <= 0 {
+            return Ok(());
+        }
+        self.with_conn(|conn| {
+            let _ = conn.pragma_update(None, "auto_vacuum", "INCREMENTAL");
+            conn.execute_batch(&format!("PRAGMA incremental_vacuum({pages});"))?;
+            Ok(())
+        })
+    }
+
     pub fn delete_device_traffic(&self, iface_name: &str, mac: &str) -> anyhow::Result<bool> {
         let mac_lower = mac.to_ascii_lowercase();
         self.with_conn(|conn| {
@@ -734,6 +766,46 @@ mod tests {
         p.load_histogram(&topo, &mut h).unwrap();
         let all = h.query_aggregate(1, None, 0, u64::MAX, crate::monitor::AggregateBucket::Hourly);
         assert_eq!(all.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_traffic_buckets_respects_retention() {
+        let dir = temp_dir("prune");
+        let p = PersistenceManager::new(&dir).unwrap();
+
+        let now = 1_700_000_000_000u64;
+        let old_start = now - (400 * 24 * 60 * 60 * 1000);
+        let recent_start = now - (10 * 24 * 60 * 60 * 1000);
+
+        p.append_iface_bucket("br-lan", &sample_bucket(old_start)).unwrap();
+        p.append_iface_bucket("br-lan", &sample_bucket(recent_start)).unwrap();
+        p.append_device_bucket("br-lan", "AA:BB:CC:DD:EE:FF", &sample_bucket(old_start)).unwrap();
+        p.append_device_bucket("br-lan", "AA:BB:CC:DD:EE:FF", &sample_bucket(recent_start)).unwrap();
+
+        // retention 0 = keep forever
+        assert_eq!(p.prune_traffic_buckets(0, now).unwrap(), 0);
+        let keep_all = p.query_i64_for_test("SELECT COUNT(*) FROM traffic_buckets").unwrap();
+        assert_eq!(keep_all, 4);
+
+        // retention 366 days: only ~400d-old rows go away
+        let deleted = p.prune_traffic_buckets(366, now).unwrap();
+        assert_eq!(deleted, 2);
+        let remaining = p.query_i64_for_test("SELECT COUNT(*) FROM traffic_buckets").unwrap();
+        assert_eq!(remaining, 2);
+        let old_left = p.query_i64_for_test(
+            "SELECT COUNT(*) FROM traffic_buckets WHERE start_ts_ms < 1000000",
+        );
+        // old_start is large; just assert remaining are the recent ones
+        assert!(old_left.is_ok());
+        let recent_left = p
+            .query_i64_for_test(&format!(
+                "SELECT COUNT(*) FROM traffic_buckets WHERE start_ts_ms >= {}",
+                recent_start as i64
+            ))
+            .unwrap();
+        assert_eq!(recent_left, 2);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

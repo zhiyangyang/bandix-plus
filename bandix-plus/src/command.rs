@@ -50,6 +50,7 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
 /// 加载 eBPF、拓扑与策略，启动采集循环与 API 服务。
 async fn run_service(options: &Options) -> anyhow::Result<()> {
     const PERIODIC_PERSIST_INTERVAL_MS: u64 = 60 * 1000;
+    const PRUNE_INTERVAL_MS: u64 = 60 * 60 * 1000;
 
     let topology = TopologySnapshot::discover()?;
     let persistence = Arc::new(PersistenceManager::new(&options.data_dir)?);
@@ -70,6 +71,19 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
     }
     log::info!("persistence data dir={}", persistence.data_dir().display());
     log::info!("traffic persistence enabled={}", options.traffic_enable_storage);
+    log::info!(
+        "traffic retention days={} (0=forever)",
+        options.traffic_retention_days
+    );
+
+    if options.traffic_enable_storage {
+        let now_ms = time_utils::now_millis();
+        match persistence.prune_traffic_buckets(options.traffic_retention_days, now_ms) {
+            Ok(deleted) if deleted > 0 => log::info!("pruned expired traffic buckets rows={deleted}"),
+            Ok(_) => {}
+            Err(e) => log::warn!("prune traffic buckets failed: {}", e),
+        }
+    }
 
     let policy = parse_policy();
 
@@ -149,8 +163,10 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
     let collector_monitor_ifaces = monitor_ifaces;
     let collector_persistence = Arc::clone(&persistence);
     let collector_traffic_enable_storage = options.traffic_enable_storage;
+    let collector_traffic_retention_days = options.traffic_retention_days;
     tokio::spawn(async move {
         let mut last_periodic_persist_ms = 0u64;
+        let mut last_prune_ms = 0u64;
         let mut ticker = tokio::time::interval(collect_interval);
         loop {
             ticker.tick().await;
@@ -238,6 +254,26 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
 
                         if runtime_saved && histogram_saved {
                             last_periodic_persist_ms = data.timestamp_ms;
+                        }
+                    }
+
+                    if collector_traffic_enable_storage
+                        && data.timestamp_ms.saturating_sub(last_prune_ms) >= PRUNE_INTERVAL_MS
+                    {
+                        match collector_persistence.prune_traffic_buckets(
+                            collector_traffic_retention_days,
+                            data.timestamp_ms,
+                        ) {
+                            Ok(deleted) => {
+                                if deleted > 0 {
+                                    log::info!("hourly prune traffic buckets rows={deleted}");
+                                    if let Err(e) = collector_persistence.incremental_vacuum(64) {
+                                        log::warn!("incremental vacuum failed: {}", e);
+                                    }
+                                }
+                                last_prune_ms = data.timestamp_ms;
+                            }
+                            Err(e) => log::warn!("hourly prune traffic buckets failed: {}", e),
                         }
                     }
                 }
