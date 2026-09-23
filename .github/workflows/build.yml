@@ -3,6 +3,8 @@
 # Description: Auto compile
 #
 name: "build"
+permissions:
+  contents: write
 on:
   repository_dispatch:
   workflow_dispatch:
